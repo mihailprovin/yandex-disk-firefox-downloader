@@ -1,0 +1,27 @@
+{
+  "manifest_version": 2,
+  "name": "Яндекс Диск — скачать по одному",
+  "version": "1.1.1",
+  "description": "Открывает файлы и вложенные папки на публичной странице Диска, нажимает Скачать и делает паузу 1 секунду. Для картинок пробует сохранить превью.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "yandex-disk-clicker@local.codex",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "permissions": [
+    "downloads", "storage", "tabs", "webRequest", "webRequestBlocking",
+    "https://disk.yandex.ru/*", "https://disk.yandex.com/*", "https://disk.yandex.kz/*",
+    "https://disk.yandex.by/*", "https://disk.yandex.com.tr/*", "https://yadi.sk/*",
+    "https://*.yandex.ru/*", "https://*.yandex.net/*", "https://*.yandex.com/*",
+    "https://*.yandex.kz/*", "https://*.yandex.by/*", "https://*.yandex.com.tr/*",
+    "https://*.yandexusercontent.com/*", "https://*.yandexcloud.net/*"
+  ],
+  "background": { "scripts": ["common.js", "background.js"], "persistent": true },
+  "browser_action": { "default_title": "Скачать файлы Яндекс Диска по одному", "default_popup": "popup.html" },
+  "content_scripts": [{
+    "matches": ["https://disk.yandex.ru/d/*", "https://disk.yandex.ru/i/*", "https://disk.yandex.com/d/*", "https://disk.yandex.com/i/*", "https://disk.yandex.kz/d/*", "https://disk.yandex.by/d/*", "https://disk.yandex.com.tr/d/*", "https://yadi.sk/d/*", "https://yadi.sk/i/*", "https://disk.yandex.ru/client/aa/*", "https://disk.360.yandex.ru/client/aa/*", "https://disk.yandex.com/client/aa/*", "https://disk.360.yandex.com/client/aa/*", "https://disk.360.yandex.kz/client/aa/*", "https://disk.360.yandex.by/client/aa/*", "https://disk.360.yandex.com.tr/client/aa/*"],
+    "js": ["common.js", "site.js", "content.js"], "run_at": "document_idle"
+  }]
+}

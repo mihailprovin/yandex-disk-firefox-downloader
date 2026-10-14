@@ -1,0 +1,41 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Тестовая папка — Яндекс Диск</title>
+<style>body{font:16px system-ui;margin:30px;background:#f3f6fa}h1{font-size:24px}.breadcrumb{margin:15px 0}.listing{display:grid;grid-template-columns:repeat(3,180px);gap:14px}.listing-item{padding:20px;background:white;border:1px solid #d2d9e4;border-radius:10px;cursor:pointer;height:110px}.listing-item__title{margin-top:15px}.slider{position:fixed;inset:0;background:#fff;z-index:10;padding:30px}.slider img{display:block;width:240px;height:180px;margin:25px}button{padding:8px 15px}</style>
+<h1>Тестовый макет публичной папки</h1><p>Этот макет используется только для проверки расширения. Это не страница Яндекса.</p>
+<div class="breadcrumb"></div><button id="whole">Скачать всё</button><div class="listing"></div><div id="view"></div>
+<script>
+window.wholeClicked = false;
+document.getElementById('whole').onclick = () => { window.wholeClicked = true; };
+const tree = {
+  '': [{name:'a.txt',kind:'file'},{name:'nested',kind:'folder'},{name:'photo.jpg',kind:'file',blocked:true,image:true},{name:'broken.txt',kind:'file',blocked:true},{name:'unknown-folder',kind:'folder',unknown:true}],
+  'nested': [{name:'b.txt',kind:'file'},{name:'empty',kind:'folder'}],
+  'nested/empty': [], 'unknown-folder': [{name:'c.txt',kind:'file'}]
+};
+let path = '', openedFile = null;
+function render() {
+  document.querySelector('.breadcrumb').textContent = 'Тестовая папка' + (path ? ' / ' + path : '');
+  const listing = document.querySelector('.listing'); listing.innerHTML = '';
+  document.getElementById('view').innerHTML = '';
+  for (const item of tree[path]) {
+    const row = document.createElement('div'); row.className = 'listing-item' + (item.kind==='folder'&&!item.unknown?' listing-item_type_dir':' listing-item_type_file'); row.dataset.name=item.name;
+    row.innerHTML = '<div>'+ (item.kind==='folder'?'📁':'📄') +'</div><div class="listing-item__title"></div>'; row.querySelector('.listing-item__title').textContent=item.name;
+    row.ondblclick = () => {
+      if (item.kind==='folder') { path = (path ? path+'/' : '')+item.name; history.pushState({path},'', '/d/fixture/'+path); render(); }
+      else openFile(item);
+    }; listing.appendChild(row);
+  }
+}
+function openFile(item) {
+  openedFile=item;
+  const view=document.getElementById('view');
+  view.innerHTML = '<section class="slider"><h2 class="slider__title"></h2><button class="slider__close" aria-label="Закрыть">×</button><button class="download"'+(item.blocked?' disabled':'')+'>Скачать</button><div class="media"></div></section>';
+  view.querySelector('h2').textContent=item.name;
+  view.querySelector('.slider__close').onclick=()=>{view.innerHTML='';openedFile=null;};
+  view.querySelector('.download').onclick=()=>window._ydRequest('https://downloader.disk.yandex.ru/disk/test?disposition=attachment&filename='+encodeURIComponent(item.name));
+  if(item.image) {
+    const canvas=document.createElement('canvas'); canvas.width=240;canvas.height=180; const ctx=canvas.getContext('2d');ctx.fillStyle='#b0dcfa';ctx.fillRect(0,0,240,180);ctx.fillStyle='#123b6e';ctx.font='20px sans-serif';ctx.fillText('Фото для теста',35,90);
+    const img=document.createElement('img');img.src=canvas.toDataURL('image/jpeg');view.querySelector('.media').appendChild(img);
+  } else view.querySelector('.media').textContent = 'Предпросмотр текстового файла';
+}
+window.addEventListener('popstate', e=>{path=e.state?.path||'';openedFile=null;render();});
+history.replaceState({path:''},'', '/d/fixture');render();
+</script></html>

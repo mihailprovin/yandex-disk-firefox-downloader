@@ -39,6 +39,11 @@
     return candidates.find(el => !el.querySelector(ROW)) || null;
   }
   function label(el) { return (el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").trim().replace(/\s+/g, " "); }
+  function viewerTitle() {
+    const scope = viewer(); if (!scope) return "";
+    const node = elements('.public-file__name, .public-file__title, .public-file-preview__title, .file-preview__title, .preview__title, .slider__title, [data-testid="file-name"]', scope)[0];
+    return node ? (node.getAttribute("title") || node.textContent.trim()) : "";
+  }
   function downloadButton() {
     const scope = viewer() || (allRows().length === 0 ? document : null);
     if (!scope) return null; // Never use the download-whole-folder button.
@@ -53,7 +58,7 @@
   function busy() { return elements('[aria-busy="true"], .listing__spin, .listing__loader, .public-folder__loader').length > 0; }
   function snapshot() {
     const rows = allRows();
-    return { url: location.href, viewer: !!viewer(), rows: rows.length,
+    return { url: location.href, viewer: !!viewer(), viewerName: viewerTitle(), rows: rows.length,
       fingerprint: rows.map(r => { try { return descriptor(r).key; } catch (_) { return "?"; } }).join("|"),
       title: titleName(), busy: busy(), challenge: challenge(),
       crumbs: elements('.breadcrumb, .breadcrumbs, [class*="crumb"], [data-testid="breadcrumbs"]').map(x => x.textContent.trim()).join(" / ") };
@@ -158,13 +163,13 @@
         const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
         canvas.getContext("2d").drawImage(best, 0, 0);
         const data = canvas.toDataURL("image/png");
-        if (data.length <= 48 * 1024 * 1024) return { data, width, height };
+        if (data.length <= 48 * 1024 * 1024) return { data, width, height, name: viewerTitle() };
       } catch (_) { /* Cross-origin images may taint a canvas; use their visible source. */ }
-      if (best.currentSrc || best.src) return { url: best.currentSrc || best.src, width, height };
+      if (best.currentSrc || best.src) return { url: best.currentSrc || best.src, width, height, name: viewerTitle() };
     }
     for (const el of elements('[class*="preview__image"], [class*="slider__image"], [class*="preview-image"]', scope)) {
       const match = getComputedStyle(el).backgroundImage.match(/^url\(["']?(.*?)["']?\)$/);
-      if (match) return { url: new URL(match[1], location.href).href };
+      if (match) return { url: new URL(match[1], location.href).href, name: viewerTitle() };
     }
     if (Date.now() < deadline && elements('img, canvas, [class*="preview__image"], [class*="slider__image"], [class*="preview-image"]', scope).length) {
       await C.delay(250, controller.signal);
@@ -181,11 +186,43 @@
     else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
     return { before };
   }
+  function arrow(direction) {
+    const scope = viewer(); if (!scope) return null;
+    const expression = direction === "next" ? /^(?:следующ(?:ий|ее|ая)(?: файл| фото| изображение| фотография)?|впер[её]д|next(?: file| image| photo)?)$/i
+      : /^(?:предыдущ(?:ий|ее|ая)(?: файл| фото| изображение| фотография)?|назад|previous(?: file| image| photo)?)$/i;
+    const selector = direction === "next" ? '.slider__arrow_right, .preview__next, [data-testid="next-file"]' : '.slider__arrow_left, .preview__prev, [data-testid="previous-file"]';
+    return [...elements('button, a, [role="button"]', scope).filter(el => expression.test(label(el))), ...elements(selector, scope)]
+      .find(el => !el.disabled && el.getAttribute("aria-disabled") !== "true") || null;
+  }
+  async function waitTitle(predicate) {
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      C.check(controller.signal);
+      if (challenge()) throw new C.FatalError("На странице проверка «Я не робот». Пройдите её вручную.");
+      const name = viewerTitle(); if (name && predicate(name)) return true;
+      await C.delay(150, controller.signal);
+    }
+    return false;
+  }
+  async function refreshViewer(item) {
+    C.check(controller.signal);
+    if (!item?.image || viewerTitle() !== item.name) return { recovered: false };
+    const direction = arrow("next") ? "next" : "previous", button = arrow(direction);
+    if (!button) return { recovered: false };
+    button.click();
+    if (!await waitTitle(name => name !== item.name)) return { recovered: false };
+    const back = arrow(direction === "next" ? "previous" : "next");
+    if (!back) return { recovered: false };
+    back.click();
+    if (!await waitTitle(name => name === item.name)) return { recovered: false };
+    await settled();
+    return { recovered: viewerTitle() === item.name, name: viewerTitle() };
+  }
   function diagnostics() {
-    return { extension: "1.1.1", time: new Date().toISOString(), page: snapshot(),
+    return { extension: "1.2.0", time: new Date().toISOString(), page: snapshot(),
       selectors: { rows: ROW, name: NAME, viewer: VIEWER, folder: FOLDER },
       cards: allRows().slice(0, 30).map(row => ({ tag: row.tagName, class: String(row.className), title: row.getAttribute("title"), text: row.textContent.trim().slice(0, 220) })),
       buttons: elements('button, [role="button"], a').slice(0, 100).map(el => ({ tag: el.tagName, label: label(el).slice(0, 100), class: String(el.className), disabled: !!el.disabled })) };
   }
-  root.YDSite = { scan, open, clickDownload, picture, closeViewer, snapshot, settled, diagnostics, stop, resume };
+  root.YDSite = { scan, open, clickDownload, picture, closeViewer, snapshot, settled, refreshViewer, diagnostics, stop, resume };
 })(globalThis);

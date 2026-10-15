@@ -52,6 +52,7 @@ async function scenario(tabs,options={}){
   console.log('PASS: no default private archive is embedded; an empty input asks for a public URL');
   const controls={show:{},example:{},status:{},url:{value:example}};let closed=false,received;
   const popup=vm.createContext({document:{getElementById(id){return controls[id];}},window:{close(){closed=true;}},
+    YDCommon: require(path.join(ext,'common.js')),
     browser:{tabs:{async query(){return[{id:1,windowId:1,url:'about:debugging'}];}},runtime:{async sendMessage(msg){received=msg;return{ok:true};}},storage:{local:{async get(){return{};}}}}});
   vm.runInContext(fs.readFileSync(path.join(ext,'popup.js'),'utf8'),popup);
   await controls.show.onclick();assert(closed);assert.equal(received.type,'openPanel');assert.equal(received.tabId,1);

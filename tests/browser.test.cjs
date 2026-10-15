@@ -32,19 +32,26 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   const browser = await chromium.launch({executablePath:process.env.YD_BROWSER_EXECUTABLE||undefined,headless:true,chromiumSandbox:true,ignoreDefaultArgs:['--unsafely-disable-devtools-self-xss-warnings','--disable-client-side-phishing-detection'],args:['--no-proxy-server'],env:{...process.env,TEMP:artifacts,TMP:artifacts}});
   try {
     const ctx = await browser.newContext({viewport:{width:1100,height:920}}), page = await ctx.newPage();
-    const source=fs.readFileSync(path.join(__dirname,'fixture.html'),'utf8');
-    await page.route('https://disk.yandex.ru/**',route=>route.fulfill({contentType:'text/html',body:source}));
+    const source=fs.readFileSync(path.join(__dirname,'fixture.html'),'utf8');let compactFixture=false;
+    await page.route('https://disk.yandex.ru/**',route=>{
+      const root=new URL(route.request().url()).pathname.split('/').filter(Boolean)[1]||'fixture';
+      let body=source.replaceAll('/d/fixture','/d/'+root);
+      if(compactFixture&&root==='fixture')body=body.replace('history.replaceState(',"tree['']=tree[''].slice(0,1);history.replaceState(");
+      return route.fulfill({contentType:'text/html',body});
+    });
     await page.route('https://disk.360.yandex.ru/**',route=>route.fulfill({contentType:'text/html',body:source.replaceAll('/d/fixture','/client/aa/d_fixture')}));
     const storage={}, items=new Map(), starts=[], ends=[], commands=[];
     let nextId=1, concurrent=0,maxConcurrent=0, slow=false, stopOnDownload=false, suppressPhoto=false, stallPhoto=false, bgContext;
     const fake={
       runtime:{onMessage:event()},
       webRequest:{onBeforeRequest:event()},
-      tabs:{onRemoved:event(),async get(){return {id:7,url:page.url()};},async goBack(){await page.goBack();},async sendMessage(id,msg){
+      tabs:{onRemoved:event(),async get(){return {id:7,url:page.url(),status:'complete'};},async goBack(){await page.goBack();},
+        async update(id,options){if(options.url){await page.goto(options.url);await attachContent();}return{id:7,url:page.url(),status:'complete'};},
+        async reload(){await page.reload();await attachContent();},async sendMessage(id,msg){
         if(msg.type==='command') commands.push(msg.name);
         return page.evaluate(async m=>{let result;for(const fn of globalThis.testContentListeners||[]){const value=await fn(m);if(value!==undefined)result=value;}return result;},msg);
       }},
-      storage:{local:{async get(key){return {[key]:storage[key]};},async set(obj){Object.assign(storage,obj);}}},
+      storage:{local:{async get(key){return Object.fromEntries((Array.isArray(key)?key:[key]).map(k=>[k,storage[k]]));},async set(obj){Object.assign(storage,obj);}}},
       downloads:{onCreated:event(),async search(query){const item=items.get(query.id);return item?[{...item}]:[];},async cancel(id){const item=items.get(id);if(item?.state==='in_progress'){item.state='interrupted';item.error='USER_CANCELED';concurrent--;clearTimeout(item.timer);}},async download(options){
         const id=nextId++, item={id,url:options.url,filename:'C:/Downloads/'+options.filename,state:'in_progress',bytesReceived:0,exists:true,byExtensionId:'test-extension'};
         items.set(id,item);starts.push({id,time:Date.now(),filename:options.filename});concurrent++;maxConcurrent=Math.max(maxConcurrent,concurrent);
@@ -72,13 +79,18 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
       const results=fake.webRequest.onBeforeRequest.listeners.map(fn=>fn({url,tabId:7,originUrl:page.url(),method:'GET',type:'main_frame'}));
       assert(results.some(r=>r.cancel),'website attachment should be captured');return true;
     });
-    async function load(client360=false){
-      await page.goto(client360?'https://disk.360.yandex.ru/client/aa/d_fixture':'https://disk.yandex.ru/d/fixture');
+    async function attachContent(){
       await page.evaluate(()=>{
+        const attach=Element.prototype.attachShadow;
+        Element.prototype.attachShadow=function(options){return attach.call(this,this.id==='yd-clicker-host'?{...options,mode:'open'}:options);}; // Test-only access to panel controls.
         globalThis.testContentListeners=[];
         globalThis.browser={runtime:{onMessage:{addListener(fn){testContentListeners.push(fn);}},sendMessage:msg=>window._ydSend(msg)},storage:{local:{async get(){return {};},async set(){}}}};
       });
       for(const file of ['common.js','site.js','content.js'])await page.addScriptTag({path:path.join(ext,file)});
+    }
+    async function load(client360=false){
+      await page.goto(client360?'https://disk.360.yandex.ru/client/aa/d_fixture':'https://disk.yandex.ru/d/fixture');
+      await attachContent();
     }
     async function finished(){
       const until=Date.now()+120000;
@@ -162,6 +174,38 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
       pass('real viewer PNG saved after '+mode+' original timeout, with no skipped image');
     }
     suppressPhoto=false;stallPhoto=false;
+
+    await load();
+    await page.evaluate(()=>{const photo=tree[''].find(x=>x.name==='photo.jpg');tree['']=[photo,{name:'second.jpg',kind:'file',blocked:true,image:true}];render();openFile(photo);});
+    const arrowForward=await page.evaluate(()=>YDSite.refreshViewer({name:'photo.jpg',image:true}));
+    assert.equal(arrowForward.recovered,true);assert.equal(await page.evaluate(()=>YDSite.snapshot().viewerName),'photo.jpg');
+    await page.evaluate(()=>openFile(tree[''][1]));
+    const arrowBackward=await page.evaluate(()=>YDSite.refreshViewer({name:'second.jpg',image:true}));
+    assert.equal(arrowBackward.recovered,true);assert.equal(await page.evaluate(()=>YDSite.snapshot().viewerName),'second.jpg');
+    const wrongPhoto=await page.evaluate(()=>YDSite.refreshViewer({name:'wrong.jpg',image:true}));assert.equal(wrongPhoto.recovered,false);
+    pass('viewer arrows reopen exactly the requested image, including the last image, and reject a mismatched name');
+
+    await load();
+    await page.evaluate(()=>{tree['']=[tree[''].find(x=>x.name==='photo.jpg')];render();document.querySelector('.listing-item').ondblclick=()=>{};});
+    await background({channel:'yd-clicker',type:'start',prefix:'ReloadRecovery',fallback:true});
+    const reloadDone=await finished();assert.equal(reloadDone.counts.previews,1);assert.equal(reloadDone.counts.errors,0);
+    assert(reloadDone.logs.some(line=>line.includes('ВОССТАНОВЛЕНИЕ')));
+    pass('a real DOM card that fails to open is recovered through page reload and content-script reinjection');
+
+    compactFixture=true;await load();
+    const panel=page.locator('#yd-clicker-host');
+    await panel.locator('#urls').fill('https://disk.yandex.ru/d/fixture\nhttps://disk.yandex.ru/d/another');
+    await panel.locator('#prefix').fill('MultiPanel');await panel.locator('#pause').fill('0.2');
+    await panel.getByRole('button',{name:'Скачать очередь',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#yd-clicker-host').shadowRoot.querySelector('#stop').disabled===false);
+    const multiDone=await finished();assert.equal(multiDone.queueTotal,2);assert.equal(multiDone.counts.originals,4);assert.equal(multiDone.counts.previews,1);
+    assert(starts.some(item=>item.filename.startsWith('MultiPanel/Диск-another-')));
+    assert.equal(storage['yd-clicker-plan'].pauseSeconds,0.2);
+    const multiStarts=starts.length;
+    await page.locator('#yd-clicker-host').getByRole('button',{name:'Продолжить очередь',exact:true}).click();
+    await delay(100);const multiResumed=await finished();assert.equal(multiResumed.counts.skipped,5);assert.equal(starts.length,multiStarts);
+    pass('panel queues two real DOM pages with a chosen pause and resumes without re-downloading saved originals or PNG');
+    compactFixture=false;
 
     await load();
     await page.evaluate(()=>{

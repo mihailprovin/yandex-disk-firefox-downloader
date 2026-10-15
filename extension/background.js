@@ -23,11 +23,18 @@ function expiredRequest(details) {
 }
 let lastStatus = { running: false, text: "Готово к работе", logs: [], counts: { originals: 0, previews: 0, skipped: 0, errors: 0 } };
 const STATUS_KEY = "yd-clicker-status", COMPLETED_KEY = "yd-clicker-completed";
+const PLAN_KEY = "yd-clicker-plan", JOURNAL_META = "yd-clicker-journal", JOURNAL_CHUNK = 200;
+let starting = false;
 let openingPanel = null;
 
 async function showDiskPanel(message) {
   let tab;
   const saved = await browser.storage.local.get("yd-clicker-last-url");
+  if (message.urls) {
+    C.links(message.urls);
+    const prefs = (await browser.storage.local.get("yd-clicker-prefs"))["yd-clicker-prefs"] || {};
+    await browser.storage.local.set({ "yd-clicker-prefs": { ...prefs, urls: message.urls } });
+  }
   const targetUrl = String(message.url || saved["yd-clicker-last-url"] || "").trim();
   if (targetUrl && !C.publicKey(targetUrl)) throw new Error("Введите публичную ссылку Яндекс Диска вида https://disk.yandex.ru/d/КОД.");
   if (message.example && !targetUrl) throw new Error("Введите ссылку на публичную папку Диска в поле расширения.");
@@ -53,12 +60,12 @@ async function showDiskPanel(message) {
   if (tab.status !== "complete") throw new Error("Страница Диска не загрузилась за 45 секунд. Проверьте Интернет и повторите.");
   if (!C.publicKey(tab.url)) throw new Error("Вкладка Диска открыла другую страницу. Откройте публичную ссылку и повторите.");
   let reply;
-  try { reply = await browser.tabs.sendMessage(tab.id, { channel: "yd-clicker", type: "show" }); }
+  try { reply = await browser.tabs.sendMessage(tab.id, { channel: "yd-clicker", type: "show", urls: message.urls }); }
   catch (_) { /* Tab may have been open before the extension was loaded. */ }
   if (!reply?.ok) {
     for (const file of ["common.js", "site.js", "content.js"])
       await browser.tabs.executeScript(tab.id, { file, runAt: "document_idle" });
-    reply = await browser.tabs.sendMessage(tab.id, { channel: "yd-clicker", type: "show" });
+    reply = await browser.tabs.sendMessage(tab.id, { channel: "yd-clicker", type: "show", urls: message.urls });
   }
   if (!reply?.ok) throw new Error("Страница не ответила. Обновите вкладку Диска и повторите.");
   await browser.tabs.update(tab.id, { active: true });
@@ -80,19 +87,62 @@ function openPanel(message) {
 
 function status(job) {
   return { running: !!active, tabId: job?.tabId, text: job?.text || lastStatus.text,
-    counts: job?.counts || lastStatus.counts, logs: (job?.logs || lastStatus.logs).slice(-150), rootUrl: job?.rootUrl };
+    counts: job?.counts || lastStatus.counts, logs: (job?.logs || lastStatus.logs).slice(-150), rootUrl: job?.rootUrl,
+    logCount: job?.logCount ?? lastStatus.logCount ?? 0, sessionId: job?.sessionId || lastStatus.sessionId,
+    queueIndex: job?.queueIndex ?? lastStatus.queueIndex ?? 0, queueTotal: job?.urls?.length ?? lastStatus.queueTotal ?? 1,
+    canResume: !!(job?.urls?.length || lastStatus.canResume), journalError: job?.journalError || lastStatus.journalError };
+}
+function writeState(job, values) {
+  job.stateWrites = (job.stateWrites || Promise.resolve()).then(() => browser.storage.local.set(values)).catch(error => {
+    job.journalError = "Не удалось сохранить журнал/прогресс: " + error.message;
+    job.controller.abort();
+  });
+  return job.stateWrites;
+}
+function plan(job) {
+  return { urls: job.urls, prefix: job.basePrefix, pauseSeconds: job.pauseMs / 1000, fallback: job.fallback,
+    recovery: job.recovery, sessionId: job.sessionId, queueIndex: job.queueIndex, savedAt: new Date().toISOString() };
+}
+async function checkpoint(job) {
+  await writeState(job, { [PLAN_KEY]: plan(job) });
+  if (job.journalError) throw new C.FatalError(job.journalError);
 }
 function log(job, text) {
-  job.text = text; job.logs.push(`[${new Date().toLocaleTimeString("ru-RU")}] ${text}`);
-  if (job.logs.length > 500) job.logs.splice(0, job.logs.length - 500);
+  const line = `[${new Date().toISOString()}] ${text}`;
+  job.text = text; job.logs.push(line); if (job.logs.length > 150) job.logs.shift();
+  job.logCount = (job.logCount || 0) + 1;
+  job.journalChunk = job.journalChunk || []; job.journalChunk.push(line);
+  const chunkIndex = Math.floor((job.logCount - 1) / JOURNAL_CHUNK);
+  const values = { [`yd-log-${job.sessionId}-${chunkIndex}`]: job.journalChunk.slice(),
+    [JOURNAL_META]: { sessionId: job.sessionId, count: job.logCount } };
+  if (job.logCount % JOURNAL_CHUNK === 0) job.journalChunk = [];
   lastStatus = status(job);
+  values[STATUS_KEY] = lastStatus; writeState(job, values);
   browser.tabs.sendMessage(job.tabId, { channel: "yd-clicker", type: "status", value: lastStatus }).catch(() => {});
+}
+async function exportJournal() {
+  if (active) await active.stateWrites;
+  const meta = (await browser.storage.local.get(JOURNAL_META))[JOURNAL_META];
+  if (!meta?.count) return { ok: false, error: "Журнал пока пуст." };
+  const parts = [];
+  for (let i = 0; i < Math.ceil(meta.count / JOURNAL_CHUNK); i++) {
+    const key = `yd-log-${meta.sessionId}-${i}`, chunk = (await browser.storage.local.get(key))[key];
+    if (!Array.isArray(chunk)) return { ok: false, error: "Не найден блок полного журнала. Экспорт остановлен, чтобы не выдать неполный файл." };
+    const count = Math.min(chunk.length, meta.count - i * JOURNAL_CHUNK);
+    parts.push(chunk.slice(0, count).join("\r\n") + "\r\n");
+  }
+  const url = URL.createObjectURL(new Blob(parts, { type: "text/plain;charset=utf-8" }));
+  try {
+    await browser.downloads.download({ url, filename: "YandexDisk-full-log-" + meta.sessionId + ".txt", saveAs: true, conflictAction: "uniquify" });
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return { ok: true, count: meta.count };
+  } catch (error) { URL.revokeObjectURL(url); return { ok: false, error: error.message }; }
 }
 async function command(job, name, extra = {}) {
   C.check(job.controller.signal);
   let reply;
   try { reply = await browser.tabs.sendMessage(job.tabId, { channel: "yd-clicker", type: "command", name, ...extra }); }
-  catch (e) { throw new Error("Нет связи со страницей: " + e.message); }
+  catch (e) { throw new C.NavigationError("Нет связи со страницей: " + e.message); }
   C.check(job.controller.signal);
   if (!reply?.ok) {
     if (reply?.fatal) throw new C.FatalError(reply.error);
@@ -112,14 +162,68 @@ async function observeUntil(job, predicate, timeout = 30000) {
     } catch (e) { if (e.name === "AbortError" || e.name === "FatalError") throw e; lastError = e; }
     await C.delay(250, job.controller.signal);
   }
-  throw new C.FatalError("Не удалось подтвердить переход страницы. " + (lastError?.message || "Возможно, сайт изменил кнопки или структуру."));
+  throw new C.NavigationError("Не удалось подтвердить переход страницы. " + (lastError?.message || "Возможно, сайт изменил кнопки или структуру."));
 }
 async function opened(job, item) {
   const action = await command(job, "open", { item });
   if (action.already) return command(job, "snapshot");
   const before = action.before;
-  await observeUntil(job, view => view.viewer !== before.viewer || view.fingerprint !== before.fingerprint || view.crumbs !== before.crumbs);
+  await observeUntil(job, view => (view.viewer && view.viewerName === item.name) || view.viewer !== before.viewer || view.fingerprint !== before.fingerprint || view.crumbs !== before.crumbs, 6000);
   return command(job, "settled");
+}
+async function readyPage(job) {
+  const until = Date.now() + 45000; let injected = false;
+  while (Date.now() < until) {
+    C.check(job.controller.signal);
+    const tab = await browser.tabs.get(job.tabId);
+    if (tab.status !== "loading") {
+      if (C.publicKey(tab.url) !== job.share) throw new C.FatalError("Вкладка ушла с выбранной публичной ссылки. Восстановление остановлено.");
+      try { await command(job, "resume"); return await command(job, "settled"); }
+      catch (error) {
+        if (error.name === "FatalError" || error.name === "AbortError") throw error;
+        if (!injected && browser.tabs.executeScript) {
+          injected = true;
+          for (const file of ["common.js", "site.js", "content.js"]) await browser.tabs.executeScript(job.tabId, { file, runAt: "document_idle" });
+        }
+      }
+    }
+    await C.delay(250, job.controller.signal);
+  }
+  throw new C.NavigationError("Страница не восстановилась за 45 секунд.");
+}
+async function navigate(job, url, reload = false) {
+  C.check(job.controller.signal);
+  const tab = await browser.tabs.get(job.tabId);
+  if (C.publicKey(tab.url) !== job.share) throw new C.FatalError("Вкладка изменена пользователем. Автоматический переход отменён.");
+  if (!C.publicKey(url)) throw new C.FatalError("Небезопасный адрес восстановления.");
+  await checkpoint(job);
+  if (reload && tab.url === url) await browser.tabs.reload(job.tabId, { bypassCache: true });
+  else await browser.tabs.update(job.tabId, { url });
+  job.share = C.publicKey(url);
+  await readyPage(job);
+}
+async function openWithRecovery(job, frame, item) {
+  try {
+    const view = item.single ? await command(job, "snapshot") : await opened(job, item);
+    if (view.viewer && view.viewerName && view.viewerName !== item.name) throw new C.NavigationError("Просмотр показывает другой файл, а не «" + item.name + "».");
+    return view;
+  } catch (error) {
+    if (!job.recovery || error.name === "AbortError" || error.name === "FatalError") throw error;
+    log(job, "СБОЙ ОТКРЫТИЯ: " + item.name + " — " + error.message);
+    try {
+      const result = await command(job, "refreshViewer", { item });
+      if (result?.recovered) {
+        const view = await command(job, "settled");
+        if (view.viewerName !== item.name) throw new C.NavigationError("После стрелок открылась другая фотография.");
+        log(job, "Просмотр восстановлен стрелками: " + item.name); return view;
+      }
+    } catch (arrowError) { if (arrowError.name === "FatalError" || arrowError.name === "AbortError") throw arrowError; }
+    log(job, "ВОССТАНОВЛЕНИЕ: обновляю папку и повторно открываю «" + item.name + "» (1 попытка).");
+    await navigate(job, frame.url, true);
+    const view = item.single ? await command(job, "snapshot") : await opened(job, item);
+    if (view.viewer && view.viewerName && view.viewerName !== item.name) throw new C.NavigationError("Имя файла в просмотре не совпало после обновления.");
+    return view;
+  }
 }
 async function returnTo(job, frame, fromFile) {
   if (fromFile) {
@@ -257,6 +361,7 @@ async function blobToPNG(blob) {
 }
 async function savePicture(job, filename) {
   const source = await command(job, "picture");
+  if (source.name && job.currentName && source.name !== job.currentName) throw new C.NavigationError("В просмотре другая фотография. Сохранение под неверным именем отменено.");
   let blob;
   if (source.data?.startsWith("data:image/png;base64,")) blob = await (await fetch(source.data)).blob();
   else {
@@ -292,22 +397,38 @@ async function savePicture(job, filename) {
   try { return await download(job, url, filename); } finally { URL.revokeObjectURL(url); }
 }
 async function remember(job, key, item, preview) {
-  job.completed[key] = { downloadId: item.id, preview, filename: item.filename };
-  try { await browser.storage.local.set({ [COMPLETED_KEY]: job.completed }); }
-  catch (e) { throw new C.FatalError("Файл сохранён, но не удалось запомнить результат: " + e.message); }
+  job.completed[key] = { downloadId: item.id, preview, filename: item.filename, savedAt: new Date().toISOString() };
+  await writeState(job, { [COMPLETED_KEY]: { ...job.completed }, [PLAN_KEY]: plan(job) });
+  if (job.journalError) throw new C.FatalError(job.journalError);
 }
-async function previouslySaved(job, key) {
-  const record = job.completed[key]; if (!record) return false;
+async function previouslySaved(job, key, legacyKey) {
+  const record = job.completed[key] || job.completed[legacyKey]; if (!record) return false;
   const [item] = await browser.downloads.search({ id: record.downloadId });
-  return item?.state === "complete" && item.exists !== false;
+  const samePath = value => value?.state === "complete" && value.exists === true && value.filename === record.filename;
+  if (samePath(item)) return true;
+  // Download IDs can change; recover by the exact recorded absolute filename.
+  if (!record.filename) return false;
+  const filenameRegex = "^" + record.filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
+  const matches = await browser.downloads.search({ filenameRegex, state: "complete", exists: true });
+  return matches.some(samePath);
 }
 async function processFile(job, frame, item) {
-  const key = JSON.stringify([job.rootUrl, job.prefix, frame.path, item.name]);
-  if (await previouslySaved(job, key)) { job.counts.skipped++; log(job, "Уже сохранён: " + [...frame.path, item.name].join("/")); return; }
-  if (job.attempted) await C.delay(1000, job.controller.signal);
+  job.currentName = item.name;
+  const key = JSON.stringify([C.rootKey(job.rootUrl), job.prefix, frame.path, item.name]);
+  const legacyKey = JSON.stringify([job.rootUrl, job.prefix, frame.path, item.name]);
+  if (await previouslySaved(job, key, legacyKey)) { job.counts.skipped++; log(job, "Уже сохранён: " + [...frame.path, item.name].join("/")); return; }
+  if (job.attempted) await C.delay(job.pauseMs, job.controller.signal);
   job.attempted = true;
   log(job, "Открываю: " + [...frame.path, item.name].join("/"));
-  const view = item.single ? await command(job, "snapshot") : await opened(job, item);
+  await checkpoint(job);
+  let view;
+  try { view = await openWithRecovery(job, frame, item); }
+  catch (error) {
+    if (error.name === "FatalError" || error.name === "AbortError") throw error;
+    job.counts.errors++; log(job, "ОШИБКА ОТКРЫТИЯ: " + item.name + " — " + error.message);
+    if (!item.single) await navigate(job, frame.url);
+    return null;
+  }
   if (!item.single && !view.viewer) {
     const child = await command(job, "scan");
     if (!child.single) return { asFolder: child };
@@ -331,7 +452,7 @@ async function processFile(job, frame, item) {
     }
     if (!saved && job.fallback && item.image) {
       log(job, "Оригинал недоступен: " + originalError.message + " Пробую картинку из просмотра.");
-      await C.delay(1000, job.controller.signal);
+      await C.delay(job.pauseMs, job.controller.signal);
       saved = await savePicture(job, C.filePath(job.prefix, frame.path, item.name, true)); isPreview = true;
     }
     if (!saved) throw originalError || new Error("Не удалось скачать файл.");
@@ -342,7 +463,13 @@ async function processFile(job, frame, item) {
     if (e.name === "AbortError" || e.name === "FatalError") throw e;
     job.counts.errors++; log(job, (e.name === "FileTimeout" ? "ПРОПУСК: " : "ОШИБКА: ") + item.name + " — " + e.message);
   }
-  if (!item.single) await returnTo(job, frame, true);
+  if (!item.single) {
+    try { await returnTo(job, frame, true); }
+    catch (error) {
+      if (!job.recovery || error.name === "FatalError" || error.name === "AbortError") throw error;
+      log(job, "ВОССТАНОВЛЕНИЕ возврата в папку: " + error.message); await navigate(job, frame.url);
+    }
+  }
   return null;
 }
 async function walk(job, first) {
@@ -350,11 +477,22 @@ async function walk(job, first) {
   while (stack.length) {
     C.check(job.controller.signal);
     const frame = stack[stack.length - 1];
-    if (frame.index >= frame.entries.length) { stack.pop(); if (stack.length) await returnTo(job, stack[stack.length - 1], false); continue; }
+    if (frame.index >= frame.entries.length) {
+      stack.pop();
+      if (stack.length) {
+        const parent = stack[stack.length - 1];
+        try { await returnTo(job, parent, false); }
+        catch (error) {
+          if (!job.recovery || error.name === "FatalError" || error.name === "AbortError") throw error;
+          log(job, "ВОССТАНОВЛЕНИЕ родительской папки: " + error.message); await navigate(job, parent.url);
+        }
+      }
+      continue;
+    }
     const item = frame.entries[frame.index++];
     if (item.type === "folder") {
       log(job, "Вхожу в папку: " + [...frame.path, item.name].join("/"));
-      await opened(job, item);
+      await openWithRecovery(job, frame, item);
       const child = await command(job, "scan");
       if (child.single) throw new C.FatalError("Карточка папки открыла файл. Сайт изменился; остановлено.");
       if (stack.length >= 100) throw new C.FatalError("Слишком много уровней папок.");
@@ -367,37 +505,91 @@ async function walk(job, first) {
 }
 async function run(job) {
   try {
-    const stored = await browser.storage.local.get(COMPLETED_KEY); job.completed = stored[COMPLETED_KEY] || {};
-    await command(job, "resume"); const first = await command(job, "scan");
-    log(job, "В текущей папке: " + first.entries.length + " карточек. Начинаю обход.");
-    await walk(job, first);
+    for (let index = 0; index < job.urls.length; index++) {
+      C.check(job.controller.signal);
+      job.queueIndex = index; const url = job.urls[index];
+      job.prefix = job.urls.length > 1 ? job.basePrefix + "/" + C.safeName("Диск-" + C.publicKey(url).split("/").pop() + "-" + C.hash(C.rootKey(url))) : job.basePrefix;
+      if (index > 0 || C.rootKey(job.rootUrl) !== C.rootKey(url) || job.resuming) await navigate(job, url, job.resuming && index === 0);
+      job.rootUrl = url; job.share = C.publicKey(url);
+      expiredClicks = expiredClicks.filter(entry => entry.tabId !== job.tabId || entry.share !== job.share);
+      log(job, "ССЫЛКА " + (index + 1) + "/" + job.urls.length + ": " + url + " → " + job.prefix);
+      await checkpoint(job);
+      await command(job, "resume");
+      let first;
+      try { first = await command(job, "scan"); }
+      catch (error) {
+        if (!job.recovery || error.name === "AbortError" || error.name === "FatalError") throw error;
+        log(job, "ВОССТАНОВЛЕНИЕ списка: " + error.message); await navigate(job, url, true); first = await command(job, "scan");
+      }
+      log(job, "В текущей папке: " + first.entries.length + " карточек. Начинаю обход.");
+      await walk(job, first);
+    }
     log(job, `Готово: ${job.counts.originals} оригиналов, ${job.counts.previews} превью, ${job.counts.skipped} уже сохранено, ${job.counts.errors} ошибок.`);
-  } catch (e) { log(job, e.name === "AbortError" ? "Остановлено. Вернитесь в начальную папку и нажмите «Скачать» для продолжения." : "Остановка: " + e.message); }
+  } catch (e) { log(job, e.name === "AbortError" ? "Остановлено. Нажмите «Продолжить очередь»: сохранённые файлы будут пропущены." : "Остановка: " + e.message); }
   finally {
     if (pending?.job === job) pending.reject(C.abortError());
     if (job.downloadId != null) await browser.downloads.cancel(job.downloadId).catch(() => {});
     if (job.siteDownload != null) await browser.downloads.cancel(job.siteDownload).catch(() => {});
     await browser.tabs.sendMessage(job.tabId, { channel: "yd-clicker", type: "command", name: "stop" }).catch(() => {});
+    await checkpoint(job).catch(() => {}); await job.stateWrites;
     active = null; lastStatus = { ...status(job), running: false };
+    if (job.journalError) lastStatus.text = job.journalError + ". Очередь остановлена; журнал не обрезался намеренно.";
     await browser.storage.local.set({ [STATUS_KEY]: lastStatus }).catch(() => {});
     browser.tabs.sendMessage(job.tabId, { channel: "yd-clicker", type: "status", value: lastStatus }).catch(() => {});
   }
+}
+async function startJob(message, sender) {
+  if (active || starting) return { ok: false, error: "Уже идёт загрузка. Сначала остановите её." };
+  starting = true;
+  try {
+    const tab = sender.tab;
+    if (!tab || !C.publicKey(tab.url)) throw new Error("Откройте публичную папку Яндекс Диска.");
+    const stored = await browser.storage.local.get([PLAN_KEY, COMPLETED_KEY, JOURNAL_META, STATUS_KEY]);
+    const resume = message.type === "resumeQueue", saved = stored[PLAN_KEY];
+    if (resume && !saved?.urls?.length) throw new Error("Нет сохранённой очереди. Сначала нажмите «Скачать очередь».");
+    const config = resume ? saved : message;
+    const urls = C.links(config.urls || ""); if (!urls.length) urls.push(tab.url);
+    const basePrefix = C.relativeRoot(config.prefix), pauseMs = C.pause(config.pauseSeconds);
+    const meta = stored[JOURNAL_META], oldStatus = stored[STATUS_KEY];
+    const continuingLog = resume && saved.sessionId && meta?.sessionId === saved.sessionId;
+    const sessionId = continuingLog ? meta.sessionId : Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 9);
+    const logCount = continuingLog ? meta.count : 0;
+    let journalChunk = [];
+    if (logCount % JOURNAL_CHUNK) {
+      const key = `yd-log-${sessionId}-${Math.floor(logCount / JOURNAL_CHUNK)}`;
+      journalChunk = (await browser.storage.local.get(key))[key];
+      if (!Array.isArray(journalChunk)) throw new Error("Не найден последний блок журнала. Продолжение остановлено, чтобы не перезаписать его.");
+      journalChunk = journalChunk.slice();
+    }
+    const completed = { ...(stored[COMPLETED_KEY] || {}) };
+    for (const [key, value] of Object.entries(completed)) {
+      try {
+        const [root, prefix, folders, name] = JSON.parse(key), identity = C.rootKey(root);
+        if (identity && Array.isArray(folders)) completed[JSON.stringify([identity, prefix, folders, name])] = value;
+      } catch (_) { /* Ignore unknown legacy record formats, never assume they were saved. */ }
+    }
+    const job = { tabId: tab.id, rootUrl: tab.url, share: C.publicKey(tab.url), prefix: basePrefix, basePrefix,
+      urls, pauseMs, resuming: resume, recovery: config.recovery !== false, queueIndex: 0,
+      fallback: config.fallback !== false, controller: new AbortController(), completed,
+      attempted: false, logs: continuingLog ? (oldStatus?.logs || []).slice(-150) : [], sessionId, logCount, journalChunk,
+      stateWrites: Promise.resolve(), counts: { originals: 0, previews: 0, skipped: 0, errors: 0 },
+      text: "Подготовка…", downloadId: null, siteDownload: null };
+    active = job;
+    await checkpoint(job);
+    if (job.journalError) { active = null; throw new Error(job.journalError); }
+    log(job, "v1.2.0 " + (resume ? "ПРОДОЛЖЕНИЕ" : "НОВАЯ ОЧЕРЕДЬ") + ": " + urls.length + " ссылок, пауза " + pauseMs / 1000 + " с.");
+    run(job); return { ok: true };
+  } catch (error) { active = null; return { ok: false, error: error.message }; }
+  finally { starting = false; }
 }
 browser.tabs.onRemoved.addListener(tabId => { if (active?.tabId === tabId) active.controller.abort(); });
 browser.runtime.onMessage.addListener((message, sender) => {
   if (message?.channel !== "yd-clicker") return undefined;
   if (message.type === "openPanel") return openPanel(message);
   if (message.type === "getStatus") return Promise.resolve({ ...(active ? status(active) : lastStatus), viewerTabId: sender.tab?.id });
-  if (message.type === "start") {
-    if (active) return Promise.resolve({ ok: false, error: "Уже идёт загрузка. Сначала остановите её." });
-    const tab = sender.tab, share = C.publicKey(tab?.url);
-    if (!tab || !share) return Promise.resolve({ ok: false, error: "Откройте публичную папку Яндекс Диска." });
-    let prefix; try { prefix = C.relativeRoot(message.prefix); } catch (e) { return Promise.resolve({ ok: false, error: e.message }); }
-    const job = { tabId: tab.id, rootUrl: tab.url, share, prefix, fallback: message.fallback !== false,
-      controller: new AbortController(), completed: {}, attempted: false, logs: [], counts: { originals: 0, previews: 0, skipped: 0, errors: 0 }, text: "Подготовка…", downloadId: null, siteDownload: null };
-    expiredClicks = expiredClicks.filter(entry => entry.tabId !== tab.id || entry.share !== share);
-    active = job; run(job); return Promise.resolve({ ok: true });
-  }
+  if (message.type === "start" || message.type === "resumeQueue") return startJob(message, sender);
+  if (message.type === "exportLog") return exportJournal();
+  if (message.type === "getPlan") return browser.storage.local.get(PLAN_KEY).then(value => ({ ok: true, plan: value[PLAN_KEY] || null }));
   if (message.type === "stop") {
     if (active && (!sender.tab || sender.tab.id === active.tabId)) {
       active.controller.abort(); browser.tabs.sendMessage(active.tabId, { channel: "yd-clicker", type: "command", name: "stop" }).catch(() => {});
@@ -406,4 +598,4 @@ browser.runtime.onMessage.addListener((message, sender) => {
   }
   return undefined;
 });
-browser.storage.local.get(STATUS_KEY).then(stored => { if (!active && stored[STATUS_KEY]) lastStatus = { ...stored[STATUS_KEY], running: false }; }).catch(() => {});
+browser.storage.local.get([STATUS_KEY, PLAN_KEY]).then(stored => { if (!active && stored[STATUS_KEY]) lastStatus = { ...stored[STATUS_KEY], running: false, canResume: !!stored[PLAN_KEY]?.urls?.length }; }).catch(() => {});

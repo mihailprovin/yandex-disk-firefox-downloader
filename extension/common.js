@@ -7,7 +7,7 @@
     try {
       const u = new URL(url), parts = u.pathname.split("/").filter(Boolean);
       const host = u.hostname.replace(/^disk\.360\./, "disk.");
-      if (u.protocol !== "https:" || !publicHosts.has(host)) return null;
+      if (u.protocol !== "https:" || u.username || u.password || u.port || !publicHosts.has(host)) return null;
       let kind, code;
       if (/^[di]$/.test(parts[0]) && parts[1]) { kind = parts[0]; code = parts[1]; }
       else if (parts[0] === "client" && parts[1] === "aa" && parts[2]) {
@@ -23,6 +23,33 @@
     let h = 2166136261;
     for (const char of text) { h ^= char.codePointAt(0); h = Math.imul(h, 16777619); }
     return (h >>> 0).toString(16).padStart(8, "0");
+  }
+  function links(text) {
+    const lines = Array.isArray(text) ? text : String(text || "").split(/\r?\n/);
+    const found = new Set(), result = [];
+    for (const line of lines) {
+      const value = String(line).trim(); if (!value) continue;
+      if (!publicKey(value)) throw new Error("Недопустимая публичная ссылка в строке " + (lines.indexOf(line) + 1));
+      const u = new URL(value); u.hash = "";
+      const identity = rootKey(u.href);
+      if (!found.has(identity)) { found.add(identity); result.push(u.href); }
+    }
+    return result;
+  }
+  function rootKey(url) {
+    const share = publicKey(url); if (!share) return null;
+    const u = new URL(url), parts = u.pathname.split("/").filter(Boolean);
+    const client = parts[0] === "client";
+    let suffix = parts.slice(client ? 3 : 2).map(decodeURIComponent).join("/");
+    if (client && parts[2]?.includes(":")) suffix = decodeURIComponent(parts[2]).split(":").slice(1).join(":") + "/" + suffix;
+    const queryPath = u.searchParams.get("path");
+    if (queryPath) suffix = queryPath;
+    return share + "/" + suffix.replace(/^\/+|\/+$/g, "");
+  }
+  function pause(value) {
+    const seconds = value === undefined || value === "" ? 1 : Number(String(value).replace(",", "."));
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) throw new Error("Пауза должна быть от 0 до 3600 секунд.");
+    return Math.round(seconds * 1000);
   }
   function safeName(text) {
     const original = String(text || "Без имени");
@@ -73,6 +100,7 @@
     });
   }
   class FatalError extends Error { constructor(message) { super(message); this.name = "FatalError"; } }
-  root.YDCommon = { publicKey, hash, safeName, relativeRoot, filePath, allowedAsset, isAttachment, sameFile, imageExtensions, abortError, check, delay, FatalError };
+  class NavigationError extends Error { constructor(message) { super(message); this.name = "NavigationError"; } }
+  root.YDCommon = { publicKey, rootKey, links, pause, hash, safeName, relativeRoot, filePath, allowedAsset, isAttachment, sameFile, imageExtensions, abortError, check, delay, FatalError, NavigationError };
   if (typeof module !== "undefined" && module.exports) module.exports = root.YDCommon;
 })(typeof globalThis !== "undefined" ? globalThis : this);

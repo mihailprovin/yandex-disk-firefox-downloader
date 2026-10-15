@@ -27,9 +27,13 @@ function render() {
 function openFile(item) {
   openedFile=item;
   const view=document.getElementById('view');
-  view.innerHTML = '<section class="slider"><h2 class="slider__title"></h2><button class="slider__close" aria-label="Закрыть">×</button><button class="download"'+(item.blocked?' disabled':'')+'>Скачать</button><div class="media"></div></section>';
+  view.innerHTML = '<section class="slider"><h2 class="slider__title"></h2><button class="slider__close" aria-label="Закрыть">×</button><button class="download"'+(item.blocked?' disabled':'')+'>Скачать</button><button class="previous" aria-label="Предыдущее фото">←</button><button class="next" aria-label="Следующее фото">→</button><div class="media"></div></section>';
   view.querySelector('h2').textContent=item.name;
   view.querySelector('.slider__close').onclick=()=>{view.innerHTML='';openedFile=null;};
+  const photos=tree[path].filter(x=>x.image), photoIndex=photos.indexOf(item);
+  view.querySelector('.previous').disabled=photoIndex<=0;view.querySelector('.next').disabled=photoIndex<0||photoIndex>=photos.length-1;
+  view.querySelector('.previous').onclick=()=>openFile(photos[photoIndex-1]);
+  view.querySelector('.next').onclick=()=>openFile(photos[photoIndex+1]);
   view.querySelector('.download').onclick=()=>window._ydRequest('https://downloader.disk.yandex.ru/disk/test?disposition=attachment&filename='+encodeURIComponent(item.name));
   if(item.image) {
     const canvas=document.createElement('canvas'); canvas.width=240;canvas.height=180; const ctx=canvas.getContext('2d');ctx.fillStyle='#b0dcfa';ctx.fillRect(0,0,240,180);ctx.fillStyle='#123b6e';ctx.font='20px sans-serif';ctx.fillText('Фото для теста',35,90);

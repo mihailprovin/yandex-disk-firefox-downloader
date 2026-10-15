@@ -26,7 +26,7 @@ for (const file of files) {
     continue;
   }
   assert(/\.(js|cjs|html|json|md|yml)$/.test(file) || [".gitignore", ".gitattributes"].includes(file), "Unreviewed source file: " + file);
-  const text = data.toString("utf8");
+  const text = data.toString("utf8").replaceAll(String.fromCharCode(92) + "n", "\n");
   assert(!/[A-Z]:[/\\]+Users[/\\]+[^/\\\s]+/i.test(text), "Personal Windows path: " + file);
   assert(!/\/(?:home|Users)\/[^/\s]+/.test(text), "Personal home path: " + file);
   assert(!/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text.replaceAll("yandex-disk-clicker@local.codex", "")), "Email address: " + file);
